@@ -169,7 +169,9 @@ export class AgentUsage {
                 basis:
                   sample.provider === "opencode"
                     ? "OpenCode session cost report; API-equivalent rates, not subscription charges"
-                    : "Claude SDK list-price estimate; https://platform.claude.com/docs/en/about-claude/pricing; verified 2026-09-07",
+                    : sample.provider === "acp"
+                      ? "ACP agent cost report; API-equivalent rates, not subscription charges"
+                      : "Claude SDK list-price estimate; https://platform.claude.com/docs/en/about-claude/pricing; verified 2026-09-07",
               };
         const turn = databaseRow(
           db

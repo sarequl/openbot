@@ -150,6 +150,7 @@ export function collectProviderUsage(
     provider: session.provider,
     model,
     counterId: `${session.id}:grok`,
+    reportedCost: isDynamicRecord(params) ? cost(params.cost) : null,
     baseline: session.createdAt < usage.collectionStartedAt(),
     tokens: acpTokens(value),
   });
@@ -194,16 +195,13 @@ export function memoryReviewUsageObserver(
   };
 }
 
-/** An ACP `Usage`, whose `inputTokens` include the cache reads and writes. */
+/** An ACP `Usage`, whose `inputTokens` include the cache reads and writes, or are the uncached input. */
 function acpTokens(value: DynamicRecord): UsageTokens {
   const input = count(value.inputTokens);
-  const cached = count(value.cachedReadTokens);
-  const creation = count(value.cachedWriteTokens);
+  const cached = count(value.cachedReadTokens ?? 0) ?? 0;
+  const creation = count(value.cachedWriteTokens ?? 0) ?? 0;
   return {
-    uncachedInput:
-      input !== null && cached !== null && creation !== null && input >= cached + creation
-        ? input - cached - creation
-        : null,
+    uncachedInput: input !== null && input >= cached + creation ? input - cached - creation : input,
     cachedInput: cached,
     cacheCreation: creation,
     output: count(value.outputTokens),
