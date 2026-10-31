@@ -8,12 +8,16 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { CUSTOM_AGENT_DEFAULT_MODEL } from "@openbot/contracts/ipc";
+import { DatabaseSync } from "node:sqlite";
+import { CUSTOM_AGENT_DEFAULT_MODEL, decodeUsageTokens } from "@openbot/contracts/ipc";
 import { Effect } from "effect";
 import { checkAcpAgent } from "../src/backend/acp-agent-check";
 import { isMissingProviderSessionError } from "../src/backend/agent/thread-items";
+import { collectProviderUsage } from "../src/backend/agent/usage-collection";
 import type { AgentClient } from "../src/backend/agent-client";
 import { runCauseEffect } from "../src/backend/effect-boundary";
+import { OpenBotDatabase } from "../src/backend/openbot-database";
+import { type AppServerNotification, getRecord, getString, isRecord } from "../src/backend/protocol";
 import { requireProviderDriver } from "../src/backend/provider-drivers";
 import { CustomAgentStore } from "../src/main/custom-agent-store";
 import { installFakeAgent, readJsonl, runTurn, startThread, stopClients, xorCipher } from "./provider-fakes/host";
@@ -45,6 +49,7 @@ interface Report {
 }
 
 const root = await mkdtemp(join(tmpdir(), "openbot-custom-agent-e2e-"));
+const database = new OpenBotDatabase(join(root, "user-data"));
 const report: Report = { passed: false };
 const clients: AgentClient[] = [];
 
@@ -54,6 +59,17 @@ function isRunning(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Waits for a state of the service or of its database. */
+async function waitFor<T>(label: string, read: () => T | null | undefined | false, timeoutMs = 20_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = read();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${label}.`);
+    await new Promise((done) => setTimeout(done, 25));
   }
 }
 
@@ -91,6 +107,9 @@ try {
         { name: "FAKE_TITLE", value: "Alpha" },
         { name: "FAKE_MODELS", value: "1" },
         { name: "FAKE_TOKEN", value: SECRET },
+        { name: "FAKE_USAGE", value: "1" },
+        { name: "FAKE_USAGE_TOKENS", value: "12000,0,0,800,0" },
+        { name: "FAKE_USAGE_COST", value: "0.05" },
       ],
       usagePrompt: "/usage",
     }),
@@ -117,6 +136,9 @@ try {
     "FAKE_TITLE",
     "FAKE_MODELS",
     "FAKE_TOKEN",
+    "FAKE_USAGE",
+    "FAKE_USAGE_TOKENS",
+    "FAKE_USAGE_COST",
   ]);
   assert.equal(summaries.find((agent) => agent.id === "alpha")?.usagePrompt, "/usage", "The usage prompt is saved.");
   assert.equal(
@@ -212,10 +234,49 @@ try {
   assert.match(betaThread, ROUTED_THREAD("beta"));
   assert.equal(sessionOf(alphaThread), sessionOf(betaThread), "Both agents give the same session id.");
 
+  const usageReports: AppServerNotification[] = [];
+  const usageListener = (notification: AppServerNotification) => {
+    if (notification.method !== "openbot/usage") return;
+    if (getString(notification.params, "threadId") !== alphaThread) return;
+    usageReports.push(notification);
+  };
+  client.on("notification", usageListener);
   const alphaReply = await reply(client, alphaThread, "alpha/deep", "hello alpha");
+  client.off("notification", usageListener);
   const betaReply = await reply(client, betaThread, "beta/default", "hello beta");
   assert.match(alphaReply, /^Alpha heard: .*hello alpha$/);
   assert.match(betaReply, /^Beta heard: .*hello beta$/);
+  // The turn of the custom agent reports its usage and its cost, and the usage records keep both.
+  const usageNotification = await waitFor("the turn's usage report", () => usageReports.at(-1) ?? null);
+  const turnId = getString(usageNotification.params, "turnId");
+  assert.ok(turnId, "The turn that ran reported its usage.");
+  const usageParams = usageNotification.params;
+  const usageValue = getRecord(usageParams, "usage");
+  assert.ok(usageValue, "The custom ACP agent reported its usage.");
+  const reportedCost = isRecord(usageParams) ? usageParams.cost : null;
+  assert.equal(typeof reportedCost, "number", "The custom ACP agent reported its cost.");
+  await runCauseEffect(database.initialize());
+  collectProviderUsage(
+    database.usage,
+    { id: "alpha", model: "alpha/deep" },
+    { id: alphaThread, provider: "acp", createdAt: new Date().toISOString() },
+    "openbot/usage",
+    usageParams,
+  );
+  const recorded = new DatabaseSync(database.path)
+    .prepare("SELECT tokens_json, estimated_cost_usd FROM agent_usage_records WHERE agent_id = ? AND turn_id = ?")
+    .all("alpha", turnId);
+  assert.equal(recorded.length, 1, "The turn of the custom agent has one usage record.");
+  const turn = recorded[0];
+  assert.ok(turn, "The turn of the custom agent has a usage record.");
+  assert.deepEqual(
+    decodeUsageTokens(JSON.parse(String(turn.tokens_json))),
+    { uncachedInput: 12_000, cachedInput: 0, cacheCreation: 0, output: 800 },
+    "The turn's own tokens, with thinking as output.",
+  );
+  const estimatedCost: number | null = typeof turn.estimated_cost_usd === "number" ? turn.estimated_cost_usd : null;
+  assert.ok(estimatedCost !== null, "The turn's cost is kept.");
+  assert.ok(Math.abs(estimatedCost - 0.05) < 1e-9, `The turn's cost is the agent's report: ${String(estimatedCost)}`);
   const alphaEntries = await readJsonl<LogEntry>(alphaLog);
   assert.ok(
     alphaEntries.every((entry) => entry.token === SECRET),
